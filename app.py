@@ -1,125 +1,186 @@
-import torch
-import torch.nn as nn
-from torchvision import transforms, models
-import numpy as np
-from PIL import Image
 import streamlit as st
+import os
+from PIL import Image
+import numpy as np
+import base64
+import io
+from datetime import datetime
+from model_utilities import create_download_zip
 
-# Custom CNN Definition
+from model_utilities import (MODEL_CONFIGS, load_model, get_transforms, 
+                        predict_image, generate_xai_explanations, 
+                        generate_lime_explanation, CLASS_NAMES)
 
-class CustomCNN(nn.Module): 
 
-    def __init__(self, num_classes): 
-        super(CustomCNN, self).__init__()
+st.set_page_config(page_title="Plum Disease Classifier", page_icon="🍃", layout="wide")
 
-        self.features = nn.Sequential(
-            # 1
-            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
+st.title("🍃 🫐 Plum Leaf and Fruit Disease Classification")
+st.markdown("---")
 
-            # 2
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
+st.sidebar.header("🔧 Model Selection")
+selected_model = st.sidebar.selectbox("Choose a model:", ["-- Select a model --"] + list(MODEL_CONFIGS.keys()))
 
-            # 3
-            nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-        )
-
-        self.flatten = nn.Flatten()
-
-        self.classifier = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Linear(512 * 28 * 28, 1024), 
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(1024, num_classes)
-        )
-
-    def forward(self, x):
-
-        x = self.features(x)
-        x = self.flatten(x)
-        return self.classifier(x)
+#  model metadata
+if selected_model and selected_model != "-- Select a model --":
+    config = MODEL_CONFIGS[selected_model]
+    with st.sidebar.expander("Model Details", expanded=True):
+        st.write(f"**Architecture:** {config['architecture']}")
+        st.write(f"**Input Size:** {config['input_size']}")
+        st.write(f"**Classes:** {config['classes']}")
+        st.write(f"**Checkpoint:** {os.path.basename(config['checkpoint_path'])}")
     
-
-
-# Model Loading Helpers
-
-def load_custom_cnn (path, num_classes, device):
-    model = CustomCNN(num_classes)
-    model.load_state_dict(torch.load(path, map_location=device, weights_only=True))
-    model.eval()
-    return model
-
-def load_resnet50(path, num_classes, device):
-    model = models.resnet50(pretrained=False)
-    model.fc = nn.Linear(model.fc.in_features, num_classes)
-    model.load_state_dict(torch.load(path, map_location=device, weights_only=True))
-    model.eval()
-    return model
-
-
-
-# Streamlit APP Setup
-
-st.title("Pumpkin Leaf Disease Classification App")
-
-model_choice = st.sidebar.selectbox("Select a Model", ["Custom CNN", "ResNet50"])
-
-uploaded_file = st.sidebar.file_uploader("Upload an image", type=["jpg", "png", "jpeg"])
-
-CLASS_NAMES = ["Bacterial Spot", "Downy Mildew", "Mosaic", "Healthy", "Powdery Mildew"]
-NUM_CLASSES = len(CLASS_NAMES)
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-@st.cache_resource
-def load_model():
-  cnn = load_custom_cnn("custom_cnn_model.pth", NUM_CLASSES, DEVICE)
-  resnet = load_resnet50("transfer_learning_resnet50.pth", NUM_CLASSES, DEVICE)
-  return cnn, resnet
-
-custom_cnn, resnet50 = load_model()
-
-
-
-# Image Preprocessing
-
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5, 0.5, 0.5], 
-                         std=[0.5, 0.5, 0.5])
-])
-
-# Prediction & Display
-
-if uploaded_file:
-    image = Image.open(uploaded_file).convert("RGB")
-    st.image(image, caption="Uploaded Image", use_column_width=True)
-
-    tensor = transform(image).unsqueeze(0).to(DEVICE)
-
-    model = custom_cnn if model_choice == "Custom CNN" else resnet50
-
-    with torch.no_grad():
-        pred = model(tensor)
-        probs = torch.softmax(pred, dim=1).cpu().numpy()[0]
+    # Loading the model
+    model, result = load_model(selected_model)
     
-    top_idx = np.argsort(probs)[::-1][:3]
-    st.subheader("Top 3 Predictions:")
-    for idx in top_idx:
-        st.write(f"{CLASS_NAMES[idx]}: {probs[idx] * 100:.2f}%")
+    if model is not None:
+        st.sidebar.success(f"✅ {selected_model} loaded!")
+                
+        st.header("Image Input")
+        
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            input_option = st.radio("Choose input method:", ["Upload Image", "Select Sample"])
+        
+        image = None
+        if input_option == "Upload Image":
+            uploaded_file = st.file_uploader("Choose an image...", type=['jpg', 'jpeg', 'png'])
+            if uploaded_file is not None:
+                image = Image.open(uploaded_file)
+        
+        elif input_option == "Select Sample":
+            sample_images = os.listdir("samples") if os.path.exists("samples") else []
+            if sample_images:
+                selected_sample = st.selectbox("Choose a sample image:", ["-- Select images from Bundle --"] + sample_images)
+                if selected_sample and selected_sample != "-- Select images from Bundle --":
+                    image = Image.open(f"samples/{selected_sample}")
+            else:
+                st.warning("⚠️ No sample images found in sample_images folder.")
+        
+        # image and predictions
+        if image is not None:
+            col1, col2 = st.columns([1, 1])
+            
+            with col1:
+                st.subheader("Input Image")
+                st.image(image, width=300)
+            
+            with col2:
+                st.subheader("🎯 Predictions")
+                
+                # Make prediction
+                predictions, final_prediction = predict_image(model, image, selected_model)
+                
+                if predictions is not None:
+                    # Styled prediction display
+                    st.markdown(f"### **🏆 Final Prediction: {final_prediction}**")
+                    
+                    st.write("**📊 Top 3 Predictions:**")
+                    for i, pred in enumerate(predictions, 1):
+                        confidence = pred['confidence']
+                        if i == 1:  # Highest confidence
+                            st.success(f"{i}. {pred['class']}: {confidence:.2f}%")
+                        elif confidence > 10:
+                            st.info(f"{i}. {pred['class']}: {confidence:.2f}%")
+                        else:
+                            st.write(f"{i}. {pred['class']}: {confidence:.2f}%")
+                    
+                    # for XAI
+                    predicted_class_idx = CLASS_NAMES.index(final_prediction)
+
+                else:
+                    st.error(f"❌ Prediction failed: {final_prediction}")
+
+            if predictions is not None:
+                st.markdown("---")
+                
+                # layout for XAI header and button
+                header_col1, header_col2 = st.columns([4, 1])
+                with header_col1:
+                    st.header("🎨 XAI Explanations")
+                with header_col2:
+                    generate_button = st.button("Generate Explanations", use_container_width=True)            
+                if generate_button:
+                    explanations_data = {}
 
 
+                    with st.spinner("🔄 Generating CAM explanations..."):
+                        explanations, error = generate_xai_explanations(
+                            model, image, selected_model, predicted_class_idx
+                        )
+                    if explanations is not None:
+                        # 5-column grid
+                        cam_methods = ['GradCAM', 'GradCAM++', 'EigenCAM', 'AblationCAM']
+                        for method_name in cam_methods:
+                            if method_name in explanations:
+                                explanations_data[method_name] = explanations[method_name]
+                    else:
+                        st.error(f"❌ CAM generation failed: {error}")
 
 
+                    with st.spinner("🔄 Generating LIME explanation..."):
+                        lime_result, lime_error = generate_lime_explanation(
+                            model, image, selected_model, predicted_class_idx
+                        )
+                        if lime_result is not None:
+                            explanations_data['LIME'] = lime_result
+                        else:
+                            st.error(f"❌ LIME generation failed: {lime_error}")
+
+                            
+                        if explanations_data:
+                            col1, col2, col3, col4, col5 = st.columns(5)
+                            columns = [col1, col2, col3, col4, col5]
+                            method_order = ['LIME', 'GradCAM', 'GradCAM++', 'EigenCAM', 'AblationCAM']
+
+                            for i, method_name in enumerate(method_order):
+                                if method_name in explanations_data:
+                                    with columns[i]:
+                                        st.markdown(f"**{method_name}**")
+                                        st.image(explanations_data[method_name], use_container_width=True)
+
+                    if explanations_data:
+                        st.success(f"✅ Generated {len(explanations_data)} explanations successfully!")
+                        st.info(f"💡 **Interpretation:** The highlighted regions show what the {selected_model} model focuses on to classify this image as '{final_prediction}'")
+
+
+                        st.markdown("---")
+                        download_col1, download_col2, download_col3 = st.columns([1, 2, 1])
+                        with download_col2:
+                            # # Import the download function
+                            # from model_utilities import create_download_zip
+
+
+                            cam_explanations = {k: v for k, v in explanations_data.items() if k != 'LIME'}
+                            lime_data = explanations_data.get('LIME', None)
+                            zip_data = create_download_zip(
+                                cam_explanations, 
+                                lime_data, 
+                                image, 
+                                selected_model, 
+                                final_prediction
+                            )
+                            if zip_data:
+                                st.download_button(
+                                    label="📥 Download Results (ZIP)",
+                                    data=zip_data,
+                                    file_name=f"plum_disease_results_{selected_model}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                                    mime="application/zip",
+                                    type="secondary",
+                                    use_container_width=True
+                                )
+                                st.caption("📦 Includes: Original image, CAM visualizations, LIME explanation, and summary report")
+                            else:
+                                st.error("❌ Failed to create download file")
+    else:
+        st.sidebar.error(f"❌ Failed to load model: {result}")
+
+
+st.markdown("---")
+st.markdown(
+    """
+    <div style='text-align: center'>
+        <p>🍃 Plum Disease Classification System | Built with Streamlit & PyTorch</p>
+    </div>
+    """, 
+    unsafe_allow_html=True
+)
