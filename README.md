@@ -42,4 +42,4 @@ Once downloaded, place all .pt files inside the models/ directory as shown above
 
 👨‍💻 Team Members & Roles
 
-[Rifa Azad] – Solo Contributor
+[Rifa Azad] – Solo Contributor - Group F
